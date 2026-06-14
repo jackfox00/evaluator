@@ -1,6 +1,6 @@
 ![Evaluator banner](banner.png)
 
-# /evaluator
+# evaluator
 
 `/evaluator` is a ChatHaikuCLI plugin for running multi-choice benchmark tests against the currently selected model endpoint.
 
