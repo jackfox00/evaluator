@@ -1,5 +1,5 @@
 """
-evaluator plugin — Multi-choice benchmark utility.
+evaluator plugin — Multi-choice benchmark suite for the current model.
 
 Loads JSONL benchmark files from plugins/evaluator/tests/, formats each item
 as a multi-choice prompt, sends it to the current chat endpoint with
@@ -49,7 +49,6 @@ import re
 import json
 import time
 import argparse
-import urllib.request
 
 
 # ──────────────────────────────────────────────────────────
@@ -772,14 +771,13 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
         return m.start() if m else None
 
     def _fetch_model_name(self, ctx):
-        """Pull the model name from /api/health for result provenance."""
+        """Pull the model name from the host's cached health state."""
         try:
-            url = ctx.server_url.rstrip("/") + "/api/health"
-            req = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            if isinstance(data, dict):
-                return data.get("model", "unknown")
+            if hasattr(ctx, "refresh_health"):
+                ctx.refresh_health()
+            model_name = getattr(ctx, "model_name", "unknown")
+            if isinstance(model_name, str) and model_name.strip():
+                return model_name.strip()
         except Exception:
             pass
         return "unknown"
