@@ -1,5 +1,5 @@
 """
-evaluator plugin — Multi-choice benchmark suite for the current model.
+evaluator plugin — Benchmark utility.
 
 Loads JSONL benchmark files from plugins/evaluator/tests/, formats each item
 as a multi-choice prompt, sends it to the current chat endpoint with
