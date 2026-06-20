@@ -1,10 +1,15 @@
 """
-evaluator plugin — Benchmark utility.
+evaluator plugin — format-aware benchmark suite.
 
-Loads JSONL benchmark files from plugins/evaluator/tests/, formats each item
-as a multi-choice prompt, sends it to the current chat endpoint with
-deterministic sampling, parses the model's reply for a letter answer, and
-tallies a score. Results land as JSON in plugins/evaluator/results/.
+Loads JSONL benchmark files from plugins/evaluator/tests/, formats each item,
+sends it to the current chat endpoint with deterministic sampling, scores the
+model reply, and saves JSON results in plugins/evaluator/results/.
+
+Supported test formats:
+  - mcqa         Multiple-choice QA. This is the original format and remains
+                 the default when a test file has no explicit format flag.
+  - open_ended  Plain open-ended QA. The model's reply is marked correct when
+                 it contains one of the expected answer strings.
 
 Designed to be a full-service, expandable benchmarking utility:
   - Drop any number of .jsonl test files into tests/, no registration step
@@ -31,17 +36,22 @@ Run flags:
 
 Test file format (JSONL, one record per line):
   Optional header (first line, ignored for scoring):
-    {"_meta": true, "name": "My Eval", "description": "..."}
+    {"_meta": true, "name": "My Eval", "test_format": "mcqa"}
 
-  Each question:
+  Legacy/default MCQA question:
     {"id": "q1", "question": "What is 7 x 8?",
      "choices": ["54", "55", "56", "63"],
      "answer": "C",
      "category": "math"}
 
-  - choices: a list of 2-26 strings
-  - answer:  a letter "A"..."Z" or a 0-indexed integer
-  - id / category: optional but recommended
+  Open-ended question:
+    {"id": "q1", "question": "What is 7 x 8?",
+     "expected_answer": "56",
+     "category": "math"}
+
+Backwards compatibility:
+  Any test file that does not declare test_format is treated as the original
+  MCQA format.
 """
 
 import os
@@ -63,12 +73,35 @@ RESULTS_DIR = os.path.join(_PLUGIN_DIR, "evaluator", "results")
 
 
 # ──────────────────────────────────────────────────────────
+#  Test formats
+# ──────────────────────────────────────────────────────────
+
+FORMAT_MCQA = "mcqa"
+FORMAT_OPEN_ENDED = "open_ended"
+
+_FORMAT_ALIASES = {
+    "mcqa": FORMAT_MCQA,
+    "multiple_choice": FORMAT_MCQA,
+    "multiplechoice": FORMAT_MCQA,
+    "multiple_choice_qa": FORMAT_MCQA,
+    "multi_choice": FORMAT_MCQA,
+    "multichoice": FORMAT_MCQA,
+    "open_ended": FORMAT_OPEN_ENDED,
+    "openended": FORMAT_OPEN_ENDED,
+    "open_qa": FORMAT_OPEN_ENDED,
+    "free_response": FORMAT_OPEN_ENDED,
+    "freeform": FORMAT_OPEN_ENDED,
+    "qa": FORMAT_OPEN_ENDED,
+}
+
+
+# ──────────────────────────────────────────────────────────
 #  Example test seeded on first launch (only when tests/ is empty)
 # ──────────────────────────────────────────────────────────
 
 EXAMPLE_TEST_NAME = "example.jsonl"
 EXAMPLE_TEST_RECORDS = [
-    {"_meta": True, "name": "Example Mini-Eval",
+    {"_meta": True, "name": "Example Mini-Eval", "test_format": FORMAT_MCQA,
      "description": "Five questions across categories. Replace or delete this file once you have your own."},
     {"id": "geo1", "category": "geography",
      "question": "What is the capital of France?",
@@ -94,13 +127,18 @@ EXAMPLE_TEST_RECORDS = [
 
 
 # ──────────────────────────────────────────────────────────
-#  Prompt template — kept simple. Edit here to experiment.
+#  Prompt templates — kept simple. Edit here to experiment.
 # ──────────────────────────────────────────────────────────
 
 DEFAULT_PROMPT_TEMPLATE = (
     "{question}\n\n"
     "{choices_block}\n\n"
     "Answer with just the letter of the correct choice."
+)
+
+OPEN_ENDED_PROMPT_TEMPLATE = (
+    "{question}\n\n"
+    "Answer directly and concisely."
 )
 
 
@@ -112,8 +150,9 @@ DEFAULT_PROMPT_TEMPLATE = (
 class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loader
     name = "evaluator"
     description = (
-        "Multi-choice benchmark suite. Loads JSONL tests from "
+        "Format-aware benchmark suite. Loads JSONL tests from "
         "plugins/evaluator/tests/ and scores the current model. "
+        "Supports legacy MCQA and flagged open-ended tests. "
         "Type /evaluator for usage."
     )
     commands = ["/evaluator", "/eval"]
@@ -142,7 +181,7 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
 
     def help_text(self) -> str:
         return (
-            "Run multi-choice benchmark tests against the current model.\n"
+            "Evaluator v1.3\n"
             "\n"
             "Usage:\n"
             "  /evaluator                         show this help\n"
@@ -161,14 +200,8 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
             "  --verbose          print each question's outcome\n"
             "\n"
             f"  Tests directory:   {TESTS_DIR}\n"
-            f"  Results directory: {RESULTS_DIR}\n"
+            f"  Results directory: {RESULTS_DIR}"
             "\n"
-            "Test file format (JSONL, one question per line):\n"
-            "  {\"id\":\"q1\", \"question\":\"...\", \"choices\":[...],\n"
-            "   \"answer\":\"B\", \"category\":\"optional\"}\n"
-            "\n"
-            "Optional first line is a metadata header:\n"
-            "  {\"_meta\":true, \"name\":\"My Eval\", \"description\":\"...\"}\n"
         )
 
     def handle(self, cmd, args, ctx) -> None:
@@ -214,8 +247,9 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
                           color=Color.YELLOW)  # noqa: F821
                 continue
             display_name = meta.get("name") or f
+            test_format = self._display_test_format(meta)
             ctx.print(f"    {f}", color=Color.DIM)  # noqa: F821
-            ctx.print(f"      {display_name}  ({len(items)} questions)",
+            ctx.print(f"      {display_name}  ({len(items)} questions, format={test_format})",
                       color=Color.DIM)  # noqa: F821
             if meta.get("description"):
                 ctx.print(f"      {meta['description']}",
@@ -235,7 +269,10 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
         if err:
             ctx.print(f"  Load error: {err}", color=Color.RED)  # noqa: F821
             return
+        test_format = meta.get("_test_format", FORMAT_MCQA)
         ctx.print(f"  File:        {os.path.basename(path)}",
+                  color=Color.DIM)  # noqa: F821
+        ctx.print(f"  Format:      {test_format}",
                   color=Color.DIM)  # noqa: F821
         if meta.get("name"):
             ctx.print(f"  Name:        {meta['name']}",
@@ -260,14 +297,24 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
             ctx.print("  Sample:", color=Color.DIM)  # noqa: F821
             ctx.print(f"    Q: {sample['question']}",
                       color=Color.DIM)  # noqa: F821
-            for i, c in enumerate(sample["choices"]):
-                ctx.print(f"    {chr(ord('A') + i)}) {c}",
+            if test_format == FORMAT_MCQA:
+                for i, c in enumerate(sample["choices"]):
+                    ctx.print(f"    {chr(ord('A') + i)}) {c}",
+                              color=Color.DIM)  # noqa: F821
+                ctx.print(
+                    f"    Answer: "
+                    f"{self._normalize_answer(sample['answer'], len(sample['choices']))}",
+                    color=Color.DIM,  # noqa: F821
+                )
+            else:
+                expected = self._normalize_expected_answers(
+                    self._get_expected_answer_value(sample)
+                )
+                ctx.print(f"    Expected: {self._format_expected_display(expected)}",
                           color=Color.DIM)  # noqa: F821
-            ctx.print(
-                f"    Answer: "
-                f"{self._normalize_answer(sample['answer'], len(sample['choices']))}",
-                color=Color.DIM,  # noqa: F821
-            )
+                if isinstance(sample.get("prompt"), str) and sample["prompt"].strip():
+                    ctx.print("    Prompt override: yes",
+                              color=Color.DIM)  # noqa: F821
 
     def _run_one(self, args, ctx) -> None:
         ns = self._parse_run_args(args, multi=False)
@@ -313,7 +360,8 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
                 if s["total"] == 0:
                     continue
                 ctx.print(
-                    f"    {s['test']:<32}  {s['correct']:>3}/{s['total']:<3}  "
+                    f"    {s['test']:<32}  {s.get('test_format', '?'):<11}  "
+                    f"{s['correct']:>3}/{s['total']:<3}  "
                     f"({s['accuracy'] * 100:5.1f}%)",
                     color=Color.DIM,  # noqa: F821
                 )
@@ -321,7 +369,7 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
             total_c = sum(s["correct"] for s in summaries)
             if total_q > 0:
                 ctx.print(
-                    f"    {'TOTAL':<32}  {total_c:>3}/{total_q:<3}  "
+                    f"    {'TOTAL':<32}  {'':<11}  {total_c:>3}/{total_q:<3}  "
                     f"({total_c / total_q * 100:5.1f}%)",
                     color=Color.GREEN,  # noqa: F821
                 )
@@ -358,9 +406,10 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
                 with open(os.path.join(RESULTS_DIR, f), "r", encoding="utf-8") as h:
                     data = json.load(h)
                 acc = data.get("accuracy", 0) * 100
+                test_format = data.get("test_format", FORMAT_MCQA)
                 ctx.print(
                     f"    {f}  {data.get('correct', 0)}/{data.get('total', 0)}  "
-                    f"({acc:.1f}%)  model={data.get('model', '?')}",
+                    f"({acc:.1f}%)  format={test_format}  model={data.get('model', '?')}",
                     color=Color.DIM,  # noqa: F821
                 )
             except Exception:
@@ -378,6 +427,8 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
         ctx.print(f"  File:      {os.path.basename(path)}",
                   color=Color.DIM)  # noqa: F821
         ctx.print(f"  Test:      {data.get('test', '?')}",
+                  color=Color.DIM)  # noqa: F821
+        ctx.print(f"  Format:    {data.get('test_format', FORMAT_MCQA)}",
                   color=Color.DIM)  # noqa: F821
         ctx.print(f"  Model:     {data.get('model', '?')}",
                   color=Color.DIM)  # noqa: F821
@@ -410,6 +461,7 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
     def _execute_test(self, path, ns, ctx):
         meta, items, err = self._load_test(path)
         test_name = os.path.basename(path)
+        test_format = meta.get("_test_format", FORMAT_MCQA)
 
         if err:
             ctx.print(f"  Load error ({test_name}): {err}",
@@ -440,6 +492,7 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
         if meta.get("name"):
             header += f" ({meta['name']})"
         ctx.print(f"  Test:     {header}", color=Color.DIM)  # noqa: F821
+        ctx.print(f"  Format:   {test_format}", color=Color.DIM)  # noqa: F821
         ctx.print(f"  Model:    {model_name}", color=Color.DIM)  # noqa: F821
         ctx.print(f"  N:        {len(work)}", color=Color.DIM)  # noqa: F821
         ctx.print(f"  Sampling: temp={ns.temp} max_new={ns.max_new}",
@@ -454,21 +507,60 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
         t_start = time.time()
         interrupted = False
         last_i = 0
+        used_prompt_override = False
 
         try:
             for i, q in enumerate(work, 1):
                 last_i = i
-                num_choices = len(q["choices"])
-                expected = self._normalize_answer(q["answer"], num_choices)
-                prompt = self._format_prompt(q)
+                prompt = self._format_prompt(q, test_format)
+                if test_format == FORMAT_OPEN_ENDED and isinstance(q.get("prompt"), str) and q["prompt"].strip():
+                    used_prompt_override = True
 
                 reply = ctx.chat(prompt, history=[], sampling_override=override)
-                predicted = self._extract_letter(reply or "", num_choices, q["choices"])
-                is_correct = (predicted is not None and predicted == expected)
+
+                if test_format == FORMAT_MCQA:
+                    num_choices = len(q["choices"])
+                    expected = self._normalize_answer(q["answer"], num_choices)
+                    predicted = self._extract_letter(reply or "", num_choices, q["choices"])
+                    is_correct = (predicted is not None and predicted == expected)
+                    item_parse_error = predicted is None
+                    detail = {
+                        "id": q.get("id", f"q{i}"),
+                        "category": q.get("category"),
+                        "test_format": test_format,
+                        "question": q["question"],
+                        "choices": q["choices"],
+                        "expected": expected,
+                        "predicted": predicted,
+                        "correct": is_correct,
+                        "raw_response": reply or "",
+                    }
+                else:
+                    expected_answers = self._normalize_expected_answers(
+                        self._get_expected_answer_value(q)
+                    )
+                    predicted = self._match_expected_answer(reply or "", expected_answers)
+                    is_correct = predicted is not None
+                    item_parse_error = False
+                    detail = {
+                        "id": q.get("id", f"q{i}"),
+                        "category": q.get("category"),
+                        "test_format": test_format,
+                        "question": q["question"],
+                        "expected": (expected_answers[0]
+                                     if len(expected_answers) == 1
+                                     else expected_answers),
+                        "expected_answers": expected_answers,
+                        "predicted": predicted,
+                        "correct": is_correct,
+                        "raw_response": reply or "",
+                    }
+                    if isinstance(q.get("prompt"), str) and q["prompt"].strip():
+                        detail["prompt"] = q["prompt"]
 
                 if is_correct:
                     correct += 1
-                if predicted is None:
+                if item_parse_error:
                     parse_errors += 1
 
                 cat = q.get("category", "(none)")
@@ -477,28 +569,27 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
                 if is_correct:
                     slot["correct"] += 1
 
-                details.append({
-                    "id": q.get("id", f"q{i}"),
-                    "category": q.get("category"),
-                    "question": q["question"],
-                    "choices": q["choices"],
-                    "expected": expected,
-                    "predicted": predicted,
-                    "correct": is_correct,
-                    "raw_response": reply or "",
-                })
+                details.append(detail)
 
                 if ns.verbose:
-                    mark = "[+]" if is_correct else ("[?]" if predicted is None else "[-]")
+                    mark = "[+]" if is_correct else ("[?]" if item_parse_error else "[-]")
                     color = (Color.GREEN if is_correct  # noqa: F821
-                             else (Color.YELLOW if predicted is None  # noqa: F821
+                             else (Color.YELLOW if item_parse_error  # noqa: F821
                                    else Color.RED))  # noqa: F821
                     q_preview = q["question"][:60]
                     if len(q["question"]) > 60:
                         q_preview += "..."
+                    expected_display = self._format_expected_display(
+                        detail.get("expected_answers", detail.get("expected"))
+                    )
+                    predicted_display = str(predicted) if predicted is not None else "None"
+                    if len(expected_display) > 28:
+                        expected_display = expected_display[:25] + "..."
+                    if len(predicted_display) > 18:
+                        predicted_display = predicted_display[:15] + "..."
                     ctx.print(
                         f"  [{i:>3}/{len(work)}] {mark} "
-                        f"expected={expected} predicted={str(predicted):>4}  "
+                        f"expected={expected_display} predicted={predicted_display:>8}  "
                         f"{q_preview}",
                         color=color,
                     )
@@ -534,11 +625,15 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
         result = {
             "test": test_name,
             "test_name": meta.get("name"),
+            "test_format": test_format,
             "model": model_name,
             "endpoint": ctx.server_url,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "params": override,
-            "prompt_template": DEFAULT_PROMPT_TEMPLATE,
+            "prompt_template": (DEFAULT_PROMPT_TEMPLATE
+                                if test_format == FORMAT_MCQA
+                                else OPEN_ENDED_PROMPT_TEMPLATE),
+            "used_prompt_override": used_prompt_override,
             "total": total,
             "answered": answered,
             "correct": correct,
@@ -584,6 +679,7 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
 
         return {
             "test": test_name,
+            "test_format": test_format,
             "total": total,
             "correct": correct,
             "accuracy": accuracy,
@@ -631,7 +727,7 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
         if not os.path.exists(path):
             return {}, [], "file not found"
         meta = {}
-        items = []
+        raw_items = []
         try:
             with open(path, "r", encoding="utf-8") as f:
                 for line_no, raw in enumerate(f, 1):
@@ -643,27 +739,92 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
                     except json.JSONDecodeError as e:
                         return {}, [], f"line {line_no} JSON: {e}"
                     if obj.get("_meta"):
-                        meta = obj
+                        meta.update(obj)
                         continue
-                    q = obj.get("question")
-                    choices = obj.get("choices")
-                    ans = obj.get("answer")
-                    if not isinstance(q, str) or not q.strip():
-                        return {}, [], f"line {line_no} missing/invalid 'question'"
-                    if not isinstance(choices, list) or len(choices) < 2:
-                        return {}, [], f"line {line_no} 'choices' must be a list of 2+"
-                    if len(choices) > 26:
-                        return {}, [], f"line {line_no} too many choices (max 26)"
-                    if ans is None:
-                        return {}, [], f"line {line_no} missing 'answer'"
-                    try:
-                        self._normalize_answer(ans, len(choices))
-                    except ValueError as e:
-                        return {}, [], f"line {line_no} {e}"
-                    items.append(obj)
+                    raw_items.append((line_no, obj))
         except OSError as e:
             return {}, [], str(e)
+
+        try:
+            test_format = self._normalize_test_format(meta)
+        except ValueError as e:
+            return meta, [], str(e)
+        meta["_test_format"] = test_format
+
+        items = []
+        for line_no, obj in raw_items:
+            if test_format == FORMAT_MCQA:
+                err = self._validate_mcqa_item(obj, line_no)
+            else:
+                err = self._validate_open_ended_item(obj, line_no)
+            if err:
+                return meta, [], err
+            items.append(obj)
+
         return meta, items, None
+
+    def _normalize_test_format(self, meta):
+        """Return canonical test format.
+
+        Backwards compatibility rule: missing format means original MCQA.
+        """
+        raw = None
+        if isinstance(meta, dict):
+            for key in ("test_format", "format", "test_type"):
+                if key in meta:
+                    raw = meta.get(key)
+                    break
+        if raw is None or raw == "":
+            return FORMAT_MCQA
+        if not isinstance(raw, str):
+            raise ValueError("metadata test_format must be a string")
+        key = raw.strip().lower().replace("-", "_").replace(" ", "_")
+        key = re.sub(r"_+", "_", key)
+        fmt = _FORMAT_ALIASES.get(key)
+        if fmt:
+            return fmt
+        valid = ", ".join(sorted({FORMAT_MCQA, FORMAT_OPEN_ENDED}))
+        raise ValueError(f"unsupported test_format {raw!r}; expected one of: {valid}")
+
+    def _display_test_format(self, meta):
+        return meta.get("_test_format", FORMAT_MCQA) if isinstance(meta, dict) else FORMAT_MCQA
+
+    def _validate_mcqa_item(self, obj, line_no):
+        q = obj.get("question")
+        choices = obj.get("choices")
+        ans = obj.get("answer")
+        if not isinstance(q, str) or not q.strip():
+            return f"line {line_no} missing/invalid 'question'"
+        if not isinstance(choices, list) or len(choices) < 2:
+            return f"line {line_no} 'choices' must be a list of 2+"
+        if len(choices) > 26:
+            return f"line {line_no} too many choices (max 26)"
+        for idx, choice in enumerate(choices):
+            if not isinstance(choice, str) or not choice.strip():
+                letter = chr(ord('A') + idx)
+                return f"line {line_no} choice {letter} must be a non-empty string"
+        if ans is None:
+            return f"line {line_no} missing 'answer'"
+        try:
+            self._normalize_answer(ans, len(choices))
+        except ValueError as e:
+            return f"line {line_no} {e}"
+        return None
+
+    def _validate_open_ended_item(self, obj, line_no):
+        q = obj.get("question")
+        if not isinstance(q, str) or not q.strip():
+            return f"line {line_no} missing/invalid 'question'"
+        value = self._get_expected_answer_value(obj)
+        if value is None:
+            return f"line {line_no} missing 'expected_answer'"
+        try:
+            self._normalize_expected_answers(value)
+        except ValueError as e:
+            return f"line {line_no} {e}"
+        if "prompt" in obj and not isinstance(obj.get("prompt"), str):
+            return f"line {line_no} optional 'prompt' must be a string"
+        return None
 
     def _normalize_answer(self, ans, num_choices):
         """Return canonical uppercase letter ('A'..'Z')."""
@@ -684,7 +845,50 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
                 return m.group(1)
         raise ValueError(f"invalid answer {ans!r} for {num_choices} choices")
 
-    def _format_prompt(self, q):
+    def _get_expected_answer_value(self, q):
+        for key in ("expected_answer", "expected_answers", "answers", "answer"):
+            if key in q:
+                return q.get(key)
+        return None
+
+    def _normalize_expected_answers(self, value):
+        """Return a non-empty list of accepted answer strings."""
+        if isinstance(value, bool) or value is None:
+            raise ValueError("expected_answer must be a non-empty string or list of strings")
+        if isinstance(value, (int, float)):
+            value = str(value)
+        if isinstance(value, str):
+            s = value.strip()
+            if not s:
+                raise ValueError("expected_answer must not be empty")
+            return [s]
+        if isinstance(value, list):
+            answers = []
+            for item in value:
+                if isinstance(item, bool) or item is None:
+                    raise ValueError("expected_answer list must contain only non-empty strings")
+                if isinstance(item, (int, float)):
+                    item = str(item)
+                if not isinstance(item, str) or not item.strip():
+                    raise ValueError("expected_answer list must contain only non-empty strings")
+                answers.append(item.strip())
+            if not answers:
+                raise ValueError("expected_answer list must not be empty")
+            return answers
+        raise ValueError("expected_answer must be a non-empty string or list of strings")
+
+    def _format_expected_display(self, expected):
+        if isinstance(expected, list):
+            return " | ".join(str(x) for x in expected)
+        return str(expected)
+
+    def _format_prompt(self, q, test_format=FORMAT_MCQA):
+        if test_format == FORMAT_OPEN_ENDED:
+            prompt = q.get("prompt")
+            if isinstance(prompt, str) and prompt.strip():
+                return prompt
+            return OPEN_ENDED_PROMPT_TEMPLATE.format(question=q["question"])
+
         choices_block = "\n".join(
             f"{chr(ord('A') + i)}) {c}" for i, c in enumerate(q["choices"])
         )
@@ -769,6 +973,40 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
             pattern = pattern + r'\b'
         m = re.search(pattern, text, re.IGNORECASE)
         return m.start() if m else None
+
+    def _match_expected_answer(self, text, expected_answers):
+        """Return the matched expected answer string, or None.
+
+        Open-ended scoring is intentionally simple: the reply is correct when
+        the normalized response contains one accepted answer string as a whole
+        token/phrase. This keeps the plugin lightweight and deterministic.
+        """
+        if not text:
+            return None
+        normalized_text = self._normalize_open_text(text)
+        if not normalized_text:
+            return None
+        matches = []
+        for answer in expected_answers:
+            normalized_answer = self._normalize_open_text(answer)
+            if not normalized_answer:
+                continue
+            pattern = r'(?<!\w)' + re.escape(normalized_answer).replace(r'\ ', r'\s+') + r'(?!\w)'
+            m = re.search(pattern, normalized_text)
+            if m:
+                matches.append((m.start(), answer))
+        if not matches:
+            return None
+        matches.sort(key=lambda x: x[0])
+        return matches[0][1]
+
+    def _normalize_open_text(self, text):
+        text = re.sub(r'<think>.*?</think>', ' ', str(text), flags=re.IGNORECASE | re.DOTALL)
+        text = text.lower()
+        text = text.replace("’", "'").replace("‘", "'")
+        text = re.sub(r"[^a-z0-9']+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
 
     def _fetch_model_name(self, ctx):
         """Pull the model name from the host's cached health state."""
