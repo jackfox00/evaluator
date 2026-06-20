@@ -2,18 +2,28 @@
 
 # evaluator
 
-`/evaluator` is a ChatHaikuCLI plugin for running multi-choice benchmark tests against the currently selected model endpoint.
+`/evaluator` is a ChatHaikuCLI plugin for running benchmark tests against the currently selected model endpoint.
 
-It loads `.jsonl` test files, turns each record into a multiple-choice prompt, sends each prompt to the active ChatHaikuCLI endpoint with deterministic evaluation settings, parses the model's answer, tallies the score, and writes a detailed JSON result file.
+It loads `.jsonl` test files, detects the test format, sends each prompt to the active ChatHaikuCLI endpoint with deterministic evaluation settings, scores the model reply, and writes a detailed JSON result file.
 
-The plugin is built for fast local model checks, small benchmark suites, regression testing, and repeatable evaluation runs from a terminal.
+Evaluator now supports two test formats:
+
+- `mcqa` — the original multiple-choice format used by Featherweight and older evaluator tests.
+- `open_ended` — plain open-ended questions where the model reply is expected to contain the answer text.
+
+For backwards compatibility, any test file without a `test_format` field is treated as the original `mcqa` format.
 
 ## What it does
 
 - Discovers benchmark files automatically from `plugins/evaluator/tests/`
 - Runs one test file or every available test file
+- Supports legacy multiple-choice QA tests
+- Supports flagged open-ended QA tests
+- Defaults unflagged test files to the original multiple-choice format
 - Scores multiple-choice questions with answers from `A` through `Z`
-- Accepts answers as either letters or 0-indexed integers in the test file
+- Accepts MCQA answers as either letters or 0-indexed integers in the test file
+- Scores open-ended questions by checking whether the reply contains the expected answer text
+- Supports optional answer aliases for open-ended questions
 - Supports optional per-question categories for category-level breakdowns
 - Saves structured JSON results to `plugins/evaluator/results/`
 - Saves partial results if a run is interrupted with `Ctrl-C`
@@ -39,7 +49,6 @@ The plugin itself uses only Python standard-library modules:
 - `os`
 - `re`
 - `time`
-- `urllib.request`
 
 No package installation is required.
 
@@ -168,12 +177,12 @@ The shorter alias works the same way:
 
 | Command | Description |
 |---|---|
-| `/evaluator` | Show usage, test directory, result directory, and test format. |
+| `/evaluator` | Show usage, test directory, result directory, and test format information. |
 | `/evaluator help` | Show the same help output. |
-| `/evaluator list` | List `.jsonl` test files in `plugins/evaluator/tests/`. |
-| `/evaluator info <test>` | Show test metadata, question count, categories, and a sample question. |
+| `/evaluator list` | List `.jsonl` test files in `plugins/evaluator/tests/`, including detected format. |
+| `/evaluator info <test>` | Show test metadata, detected format, question count, categories, and a sample question. |
 | `/evaluator run <test> [flags]` | Run one test file. |
-| `/evaluator run-all [flags]` | Run every `.jsonl` test file in `tests/`. |
+| `/evaluator run-all [flags]` | Run every `.jsonl` test file in `tests/`. Mixed MCQA and open-ended suites are supported. |
 | `/evaluator results` | List recent result JSON files. |
 | `/evaluator results <test>` | Show the latest result file for a specific test. |
 | `/eval ...` | Alias for `/evaluator ...`. |
@@ -184,7 +193,7 @@ The shorter alias works the same way:
 |---|---|
 | `--limit N` | Stop after the first `N` questions. |
 | `--temp F` | Override temperature. Default is `0.0`. |
-| `--max-new N` | Override `max_new_tokens`. Default is `20`. |
+| `--max-new N` | Override `max_new_tokens`. Default is `20`. Open-ended tests may benefit from a slightly larger value. |
 | `--no-save` | Run the test without writing a result file. |
 | `--verbose` | Print every question outcome inline. |
 
@@ -196,6 +205,12 @@ Examples:
 /evaluator run example --verbose
 /evaluator run example --no-save
 /evaluator run-all --limit 25
+```
+
+For open-ended tests, a little extra generation room can help if the model tends to answer in full sentences:
+
+```text
+/evaluator run featherweight_open_ended --max-new 40 --verbose
 ```
 
 ## Evaluation sampling
@@ -232,13 +247,37 @@ Each non-empty line must be one JSON object.
 The first line may be an optional metadata header:
 
 ```json
-{"_meta": true, "name": "Arithmetic Smoke Test", "description": "Short multiple-choice arithmetic check."}
+{"_meta": true, "name": "Arithmetic Smoke Test", "description": "Short arithmetic check.", "test_format": "mcqa"}
 ```
 
-Every question record needs:
+The canonical format flag is:
 
 ```json
-{"id": "math1", "category": "arithmetic", "question": "What is 7 multiplied by 8?", "choices": ["54", "55", "56", "63"], "answer": "C"}
+"test_format": "mcqa"
+```
+
+or:
+
+```json
+"test_format": "open_ended"
+```
+
+If `test_format` is omitted, Evaluator treats the file as `mcqa`. This preserves compatibility with older tests and the original Featherweight multiple-choice JSONL.
+
+## Format: `mcqa`
+
+`mcqa` is the original evaluator format. It is also the default for every unflagged test file.
+
+Metadata header:
+
+```json
+{"_meta": true, "name": "Mini General Eval", "description": "Five basic multiple-choice questions.", "test_format": "mcqa"}
+```
+
+Question record:
+
+```json
+{"id": "math1", "category": "math", "question": "What is 7 multiplied by 8?", "choices": ["54", "55", "56", "63"], "answer": "C"}
 ```
 
 Required fields:
@@ -256,10 +295,10 @@ Optional fields:
 | `id` | string | Stable question identifier used in result details. |
 | `category` | string | Category label used for breakdowns. |
 
-A complete test file:
+A complete MCQA test file:
 
 ```jsonl
-{"_meta": true, "name": "Mini General Eval", "description": "Five questions across basic categories."}
+{"_meta": true, "name": "Mini General Eval", "description": "Five questions across basic categories.", "test_format": "mcqa"}
 {"id": "geo1", "category": "geography", "question": "What is the capital of France?", "choices": ["Berlin", "Paris", "Madrid", "Rome"], "answer": "B"}
 {"id": "math1", "category": "math", "question": "What is 7 multiplied by 8?", "choices": ["54", "55", "56", "63"], "answer": "C"}
 {"id": "sci1", "category": "science", "question": "Which planet is closest to the sun?", "choices": ["Venus", "Earth", "Mercury", "Mars"], "answer": "C"}
@@ -267,9 +306,56 @@ A complete test file:
 {"id": "hist1", "category": "history", "question": "In what year did World War II end in Europe?", "choices": ["1942", "1945", "1948", "1950"], "answer": "B"}
 ```
 
+## Format: `open_ended`
+
+`open_ended` is for regular question-answer prompts without visible choices. It must be enabled with the metadata flag:
+
+```json
+{"_meta": true, "name": "Open QA Smoke Test", "description": "Plain question-answer evaluation.", "test_format": "open_ended"}
+```
+
+Question record:
+
+```json
+{"id": "geo1", "category": "geography", "question": "What is the capital of France?", "expected_answer": "Paris"}
+```
+
+Required fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `question` | string | The open-ended question shown to the model. |
+| `expected_answer` | string or array of strings | Accepted answer text. The reply is scored correct if it contains one accepted answer. |
+
+Optional fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | Stable question identifier used in result details. |
+| `category` | string | Category label used for breakdowns. |
+| `prompt` | string | Full prompt override. If present, Evaluator sends this exact prompt instead of formatting `question`. |
+
+A complete open-ended test file:
+
+```jsonl
+{"_meta": true, "name": "Open QA Mini Eval", "description": "Five open-ended basic questions.", "test_format": "open_ended"}
+{"id": "geo1", "category": "geography", "question": "What is the capital of France?", "expected_answer": "Paris"}
+{"id": "math1", "category": "math", "question": "What is 7 multiplied by 8?", "expected_answer": "56"}
+{"id": "sci1", "category": "science", "question": "Which planet is closest to the sun?", "expected_answer": "Mercury"}
+{"id": "lang1", "category": "language", "question": "What part of speech is the word run in the sentence I run daily?", "expected_answer": "verb"}
+{"id": "hist1", "category": "history", "question": "In what year did World War II end in Europe?", "expected_answer": "1945"}
+```
+
+Open-ended questions can also include accepted aliases:
+
+```jsonl
+{"_meta": true, "name": "Alias Example", "test_format": "open_ended"}
+{"id": "country1", "question": "What country is commonly abbreviated as the USA?", "expected_answer": ["United States", "United States of America", "USA"]}
+```
+
 ## Prompt format
 
-Evaluator formats every question like this:
+For MCQA tests, Evaluator formats every question like this:
 
 ```text
 {question}
@@ -282,9 +368,28 @@ D) {choice_4}
 Answer with just the letter of the correct choice.
 ```
 
-The prompt template is intentionally simple and can be edited directly in `DEFAULT_PROMPT_TEMPLATE` inside `evaluator.py`.
+For open-ended tests, Evaluator formats every question like this:
 
-## Answer parsing
+```text
+{question}
+
+Answer directly and concisely.
+```
+
+If an open-ended question record includes a `prompt` field, Evaluator sends that exact string instead. This is useful for datasets that already store prompt text in a `user: ...\nbot:` shape:
+
+```json
+{"id": "geo1", "question": "What is the capital of France?", "prompt": "user: What is the capital of France?\nbot:", "expected_answer": "Paris"}
+```
+
+The prompt templates are intentionally simple and can be edited directly in `evaluator.py`:
+
+- `DEFAULT_PROMPT_TEMPLATE`
+- `OPEN_ENDED_PROMPT_TEMPLATE`
+
+## Answer parsing and scoring
+
+### MCQA scoring
 
 Evaluator asks for a letter answer, but it also handles common model behaviors.
 
@@ -300,6 +405,23 @@ Parsing order:
 If no valid answer is found, the result is counted as a parse error.
 
 Choice-text matching uses case-insensitive, word-boundary-aware matching so short answer choices do not accidentally match inside longer words or numbers.
+
+### Open-ended scoring
+
+Open-ended scoring is intentionally simple and deterministic. The model reply is marked correct when the normalized reply contains one accepted expected answer string.
+
+Normalization is case-insensitive and punctuation-tolerant. It also uses token/phrase boundaries so short answers do not match inside longer words.
+
+Examples:
+
+| Expected answer | Model reply | Result |
+|---|---|---|
+| `Paris` | `The answer is Paris.` | Correct |
+| `1945` | `World War II ended in Europe in 1945.` | Correct |
+| `run` | `The word is running.` | Incorrect |
+| `United States` | `The United States of America.` | Correct |
+
+Open-ended misses are counted as incorrect answers, not parse errors. Parse errors are mainly meaningful for MCQA letter extraction.
 
 ## Results
 
@@ -321,16 +443,18 @@ Each result includes:
 |---|---|
 | `test` | Test file name. |
 | `test_name` | Optional name from the `_meta` record. |
-| `model` | Model name discovered from `/api/health`, or `unknown` if unavailable. |
+| `test_format` | Detected test format: `mcqa` or `open_ended`. |
+| `model` | Model name discovered from the host health state, or `unknown` if unavailable. |
 | `endpoint` | Active ChatHaikuCLI server endpoint. |
 | `timestamp` | Local run timestamp. |
 | `params` | Evaluation sampling parameters. |
 | `prompt_template` | Prompt template used for the run. |
+| `used_prompt_override` | Whether any open-ended item used its own `prompt` field. |
 | `total` | Number of scored questions. |
-| `answered` | Number of questions with parseable model answers. |
+| `answered` | Number of questions with parseable model answers. For open-ended tests this usually equals `total`. |
 | `correct` | Correct answer count. |
-| `incorrect` | Incorrect answer count excluding parse errors. |
-| `parse_errors` | Number of unparseable model replies. |
+| `incorrect` | Incorrect answer count excluding MCQA parse errors. |
+| `parse_errors` | Number of unparseable MCQA replies. |
 | `accuracy` | Correct divided by total. |
 | `accuracy_parsed_only` | Correct divided by parseable answers. |
 | `elapsed_seconds` | Wall-clock runtime. |
@@ -338,7 +462,9 @@ Each result includes:
 | `interrupted` | Whether the run was interrupted. |
 | `details` | Per-question scoring records and raw model replies. |
 
-Result detail records include the question ID, category, question text, choices, expected answer, predicted answer, correctness, and raw model response.
+MCQA detail records include the question ID, category, format, question text, choices, expected letter, predicted letter, correctness, and raw model response.
+
+Open-ended detail records include the question ID, category, format, question text, expected answer or answer aliases, matched answer if found, correctness, and raw model response.
 
 ## Reading results in chat
 
@@ -354,18 +480,18 @@ Show the latest result for a test:
 /evaluator results example
 ```
 
-The command prints the file name, test name, model, endpoint, timestamp, score, parse error count, and category breakdown when available.
+The command prints the file name, test name, detected format, model, endpoint, timestamp, score, parse error count, and category breakdown when available.
 
-## Running larger suites
+## Running mixed suites
 
 Drop multiple `.jsonl` files into `plugins/evaluator/tests/`:
 
 ```text
 plugins/evaluator/tests/
+├─ featherweight.jsonl
+├─ featherweight_open_ended.jsonl
 ├─ arithmetic.jsonl
-├─ reasoning.jsonl
-├─ coding.jsonl
-└─ safety.jsonl
+└─ reasoning.jsonl
 ```
 
 Run them all:
@@ -374,7 +500,7 @@ Run them all:
 /evaluator run-all
 ```
 
-Evaluator prints a suite summary with each test score and a total score across all completed tests.
+Evaluator detects each file's format independently, so legacy MCQA files and flagged open-ended files can run in the same suite.
 
 Use `Ctrl-C` to stop a long run. Completed questions are preserved in a partial result file unless `--no-save` is active.
 
@@ -424,9 +550,23 @@ For exploratory sampling behavior:
 /evaluator run reasoning --temp 0.2 --max-new 32 --verbose
 ```
 
+For open-ended answer containment checks:
+
+```text
+/evaluator run featherweight_open_ended --max-new 40 --verbose
+```
+
 ## Designing good tests
 
-Keep each question answerable from the choices alone. Avoid ambiguous wording, overlapping choices, and questions where several choices are arguably correct.
+For MCQA tests, keep each question answerable from the choices alone. Avoid ambiguous wording, overlapping choices, and questions where several choices are arguably correct.
+
+For open-ended tests, keep expected answers short and specific. Use answer aliases when a correct response could reasonably use different wording.
+
+Good open-ended alias example:
+
+```jsonl
+{"id": "q1", "category": "geography", "question": "What country is Tokyo in?", "expected_answer": ["Japan", "Nippon"]}
+```
 
 Use `category` consistently if you want useful breakdowns:
 
@@ -437,6 +577,27 @@ Use `category` consistently if you want useful breakdowns:
 ```
 
 Prefer stable IDs. They make it easier to compare result files across model versions.
+
+## Backwards compatibility notes
+
+This update is additive.
+
+Existing MCQA files still work unchanged:
+
+```jsonl
+{"_meta": true, "name": "Old MCQA Test"}
+{"id": "q1", "question": "What is 2 + 2?", "choices": ["3", "4", "5", "6"], "answer": "B"}
+```
+
+Because there is no `test_format`, the plugin treats the file as `mcqa`.
+
+Open-ended files must explicitly declare:
+
+```json
+"test_format": "open_ended"
+```
+
+Without that flag, a file missing `choices` will be interpreted as MCQA and fail validation. This is intentional so older tests do not change behavior accidentally.
 
 ## Troubleshooting
 
@@ -471,7 +632,7 @@ Then reload:
 
 If the plugin still does not load, check the terminal output for an import error.
 
-### A test fails to load
+### A MCQA test fails to load
 
 Evaluator validates every JSONL line before running. Common causes:
 
@@ -480,6 +641,7 @@ Evaluator validates every JSONL line before running. Common causes:
 - missing `choices`
 - fewer than 2 choices
 - more than 26 choices
+- empty choice strings
 - missing `answer`
 - answer letter outside the available choice range
 - answer integer outside the available 0-indexed range
@@ -492,6 +654,21 @@ Use:
 
 to check whether a test loads and to inspect the first question.
 
+### An open-ended test fails to load
+
+Confirm the metadata header includes:
+
+```json
+{"_meta": true, "test_format": "open_ended"}
+```
+
+Then check that each question has:
+
+- `question`
+- `expected_answer`
+
+`expected_answer` can be a single string or a list of accepted strings.
+
 ### Results are not being saved
 
 Results are not written when `--no-save` is used. Without that flag, result files are saved to:
@@ -500,19 +677,30 @@ Results are not written when `--no-save` is used. Without that flag, result file
 plugins/evaluator/results/
 ```
 
-### Model shows many parse errors
+### MCQA model shows many parse errors
 
 The model is not returning a clear letter or choice text. Try a lower temperature, increase `--max-new` slightly, or adjust the prompt template in `DEFAULT_PROMPT_TEMPLATE`.
 
-### Model name is `unknown`
+### Open-ended model gives correct answers but scores incorrectly
 
-Evaluator tries to read the model name from:
+The containment scorer is intentionally strict. Add aliases to `expected_answer` for valid alternate wording:
 
-```text
-/api/health
+```json
+{"expected_answer": ["United States", "United States of America", "USA"]}
 ```
 
-If the current endpoint does not expose a compatible health route, results still save normally with `model` set to `unknown`.
+You can also inspect raw replies with:
+
+```text
+/evaluator run <test> --verbose
+/evaluator results <test>
+```
+
+### Model name is `unknown`
+
+Evaluator tries to read the model name from the host's cached health state.
+
+If the current endpoint does not expose compatible health data, results still save normally with `model` set to `unknown`.
 
 ### Runs are slow
 
