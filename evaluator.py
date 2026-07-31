@@ -1,5 +1,5 @@
 """
-evaluator plugin — format-aware benchmark suite.
+evaluator plugin — format-aware benchmark suite for the current model.
 
 Loads JSONL benchmark files from plugins/evaluator/tests/, formats each item,
 sends it to the current chat endpoint with deterministic sampling, scores the
@@ -78,6 +78,16 @@ RESULTS_DIR = os.path.join(_PLUGIN_DIR, "evaluator", "results")
 
 FORMAT_MCQA = "mcqa"
 FORMAT_OPEN_ENDED = "open_ended"
+FORMAT_CHECKS = "checks"      # ChatbotGym: deterministic rule-based scoring
+FORMAT_JUDGE = "judge"        # ChatbotGym: LLM-as-judge rubric scoring
+
+# Check types understood by the deterministic `checks` scorer.
+_CHECK_TYPES = {
+    "contains", "contains_any", "contains_all", "not_contains",
+    "regex", "equals", "starts_with", "ends_with",
+    "max_words", "min_words", "max_chars", "min_chars",
+    "line_count", "is_json", "json_has_key",
+}
 
 _FORMAT_ALIASES = {
     "mcqa": FORMAT_MCQA,
@@ -92,6 +102,14 @@ _FORMAT_ALIASES = {
     "free_response": FORMAT_OPEN_ENDED,
     "freeform": FORMAT_OPEN_ENDED,
     "qa": FORMAT_OPEN_ENDED,
+    "checks": FORMAT_CHECKS,
+    "check": FORMAT_CHECKS,
+    "rubric_checks": FORMAT_CHECKS,
+    "deterministic": FORMAT_CHECKS,
+    "judge": FORMAT_JUDGE,
+    "llm_judge": FORMAT_JUDGE,
+    "model_graded": FORMAT_JUDGE,
+    "graded": FORMAT_JUDGE,
 }
 
 
@@ -181,7 +199,7 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
 
     def help_text(self) -> str:
         return (
-            "Evaluator v1.3\n"
+            "Run benchmark tests against the current model.\n"
             "\n"
             "Usage:\n"
             "  /evaluator                         show this help\n"
@@ -200,8 +218,24 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
             "  --verbose          print each question's outcome\n"
             "\n"
             f"  Tests directory:   {TESTS_DIR}\n"
-            f"  Results directory: {RESULTS_DIR}"
+            f"  Results directory: {RESULTS_DIR}\n"
             "\n"
+            "Supported test formats:\n"
+            "  mcqa         original multiple-choice format; default if omitted\n"
+            "  open_ended   plain question + expected_answer containment scoring\n"
+            "  checks       chatbot prompt + deterministic rule checks (no judge)\n"
+            "  judge        chatbot prompt + rubric graded by a separate judge model\n"
+            "\n"
+            "Optional first line is a metadata header:\n"
+            "  {\"_meta\":true, \"name\":\"My Eval\", \"test_format\":\"mcqa\"}\n"
+            "\n"
+            "MCQA question:\n"
+            "  {\"id\":\"q1\", \"question\":\"...\", \"choices\":[...],\n"
+            "   \"answer\":\"B\", \"category\":\"optional\"}\n"
+            "\n"
+            "Open-ended question:\n"
+            "  {\"id\":\"q1\", \"question\":\"...\",\n"
+            "   \"expected_answer\":\"Paris\", \"category\":\"optional\"}\n"
         )
 
     def handle(self, cmd, args, ctx) -> None:
@@ -295,7 +329,7 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
         if items:
             sample = items[0]
             ctx.print("  Sample:", color=Color.DIM)  # noqa: F821
-            ctx.print(f"    Q: {sample['question']}",
+            ctx.print(f"    Q: {sample.get('question') or sample.get('prompt') or ''}",
                       color=Color.DIM)  # noqa: F821
             if test_format == FORMAT_MCQA:
                 for i, c in enumerate(sample["choices"]):
@@ -306,7 +340,7 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
                     f"{self._normalize_answer(sample['answer'], len(sample['choices']))}",
                     color=Color.DIM,  # noqa: F821
                 )
-            else:
+            elif test_format == FORMAT_OPEN_ENDED:
                 expected = self._normalize_expected_answers(
                     self._get_expected_answer_value(sample)
                 )
@@ -314,6 +348,14 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
                           color=Color.DIM)  # noqa: F821
                 if isinstance(sample.get("prompt"), str) and sample["prompt"].strip():
                     ctx.print("    Prompt override: yes",
+                              color=Color.DIM)  # noqa: F821
+            else:
+                if test_format == FORMAT_CHECKS and isinstance(sample.get("checks"), list):
+                    ctx.print(f"    Checks: {len(sample['checks'])} rule(s)",
+                              color=Color.DIM)  # noqa: F821
+                if test_format == FORMAT_JUDGE and isinstance(sample.get("rubric"), str):
+                    rub = sample["rubric"]
+                    ctx.print(f"    Rubric: {rub[:100]}{'...' if len(rub) > 100 else ''}",
                               color=Color.DIM)  # noqa: F821
 
     def _run_one(self, args, ctx) -> None:
@@ -474,6 +516,18 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
 
         work = items if ns.limit is None else items[:ns.limit]
 
+        # Resolve max_new_tokens. Legacy formats keep the historical 20;
+        # chatbot formats need real room to reply. A test may set its own
+        # default via a `max_new_tokens` field in its _meta header.
+        if ns.max_new is not None:
+            resolved_max_new = ns.max_new
+        elif isinstance(meta.get("max_new_tokens"), int):
+            resolved_max_new = meta["max_new_tokens"]
+        elif test_format in (FORMAT_CHECKS, FORMAT_JUDGE):
+            resolved_max_new = 384
+        else:
+            resolved_max_new = 20
+
         # Eval-specific sampling override. We use top_k=1 alongside temp=0
         # so we get hard-greedy decoding even if the server treats 0.0 as
         # a small epsilon.
@@ -481,10 +535,13 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
             "temperature": ns.temp,
             "top_p": 1.0,
             "top_k": 1 if ns.temp == 0.0 else 0,
-            "max_new_tokens": ns.max_new,
+            "max_new_tokens": resolved_max_new,
             "repetition_penalty": 1.0,
             "no_repeat_ngram": 0,
         }
+
+        # Judge backend config (only used by FORMAT_JUDGE tests).
+        judge_cfg = self._judge_cfg_from_meta(meta)
 
         model_name = self._fetch_model_name(ctx)
 
@@ -535,7 +592,7 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
                         "correct": is_correct,
                         "raw_response": reply or "",
                     }
-                else:
+                elif test_format == FORMAT_OPEN_ENDED:
                     expected_answers = self._normalize_expected_answers(
                         self._get_expected_answer_value(q)
                     )
@@ -558,6 +615,51 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
                     if isinstance(q.get("prompt"), str) and q["prompt"].strip():
                         detail["prompt"] = q["prompt"]
 
+                elif test_format == FORMAT_CHECKS:
+                    is_correct, checks_passed, checks_total, check_results = \
+                        self._score_checks(reply, q)
+                    item_parse_error = False
+                    predicted = f"{checks_passed}/{checks_total} checks"
+                    detail = {
+                        "id": q.get("id", f"q{i}"),
+                        "category": q.get("category"),
+                        "test_format": test_format,
+                        "question": q.get("question") or q.get("prompt"),
+                        "prompt": q.get("prompt"),
+                        "checks_passed": checks_passed,
+                        "checks_total": checks_total,
+                        "check_results": check_results,
+                        "predicted": predicted,
+                        "correct": is_correct,
+                        "raw_response": reply or "",
+                    }
+                elif test_format == FORMAT_JUDGE:
+                    max_score = q.get("max_score", 5)
+                    threshold = q.get("pass_threshold", (max_score + 1) / 2.0)
+                    j_score, j_raw, j_err = self._run_judge(prompt, reply, q, judge_cfg, ctx)
+                    if j_err or j_score is None:
+                        is_correct = False
+                        item_parse_error = True   # judge failed to return a score
+                    else:
+                        is_correct = j_score >= threshold
+                        item_parse_error = False
+                    predicted = (f"{j_score}/{max_score}" if j_score is not None else None)
+                    detail = {
+                        "id": q.get("id", f"q{i}"),
+                        "category": q.get("category"),
+                        "test_format": test_format,
+                        "question": q.get("question") or q.get("prompt"),
+                        "prompt": q.get("prompt"),
+                        "rubric": q.get("rubric"),
+                        "judge_score": j_score,
+                        "judge_max": max_score,
+                        "pass_threshold": threshold,
+                        "judge_output": j_raw,
+                        "judge_error": j_err,
+                        "predicted": predicted,
+                        "correct": is_correct,
+                        "raw_response": reply or "",
+                    }
                 if is_correct:
                     correct += 1
                 if item_parse_error:
@@ -576,8 +678,9 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
                     color = (Color.GREEN if is_correct  # noqa: F821
                              else (Color.YELLOW if item_parse_error  # noqa: F821
                                    else Color.RED))  # noqa: F821
-                    q_preview = q["question"][:60]
-                    if len(q["question"]) > 60:
+                    q_text = q.get("question") or q.get("prompt") or ""
+                    q_preview = q_text[:60]
+                    if len(q_text) > 60:
                         q_preview += "..."
                     expected_display = self._format_expected_display(
                         detail.get("expected_answers", detail.get("expected"))
@@ -713,7 +816,10 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
             parser.add_argument("test")
         parser.add_argument("--limit", type=int, default=None)
         parser.add_argument("--temp", type=float, default=0.0)
-        parser.add_argument("--max-new", type=int, default=20, dest="max_new")
+        # Default is None (a sentinel). It resolves to 20 for the legacy
+        # mcqa/open_ended paths (unchanged behavior) and to a larger value
+        # for the chatbot formats, which need room to actually reply.
+        parser.add_argument("--max-new", type=int, default=None, dest="max_new")
         parser.add_argument("--no-save", action="store_true", dest="no_save")
         parser.add_argument("--verbose", action="store_true")
         try:
@@ -755,8 +861,14 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
         for line_no, obj in raw_items:
             if test_format == FORMAT_MCQA:
                 err = self._validate_mcqa_item(obj, line_no)
-            else:
+            elif test_format == FORMAT_OPEN_ENDED:
                 err = self._validate_open_ended_item(obj, line_no)
+            elif test_format == FORMAT_CHECKS:
+                err = self._validate_checks_item(obj, line_no)
+            elif test_format == FORMAT_JUDGE:
+                err = self._validate_judge_item(obj, line_no)
+            else:
+                err = f"line {line_no} unhandled format {test_format!r}"
             if err:
                 return meta, [], err
             items.append(obj)
@@ -783,7 +895,7 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
         fmt = _FORMAT_ALIASES.get(key)
         if fmt:
             return fmt
-        valid = ", ".join(sorted({FORMAT_MCQA, FORMAT_OPEN_ENDED}))
+        valid = ", ".join(sorted({FORMAT_MCQA, FORMAT_OPEN_ENDED, FORMAT_CHECKS, FORMAT_JUDGE}))
         raise ValueError(f"unsupported test_format {raw!r}; expected one of: {valid}")
 
     def _display_test_format(self, meta):
@@ -883,6 +995,10 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
         return str(expected)
 
     def _format_prompt(self, q, test_format=FORMAT_MCQA):
+        if test_format in (FORMAT_CHECKS, FORMAT_JUDGE):
+            # Send exactly what an end user would type. No answer-format
+            # instructions are appended; following the prompt IS the test.
+            return q["prompt"]
         if test_format == FORMAT_OPEN_ENDED:
             prompt = q.get("prompt")
             if isinstance(prompt, str) and prompt.strip():
@@ -1019,6 +1135,285 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
         except Exception:
             pass
         return "unknown"
+
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  ChatbotGym: deterministic `checks` scoring + LLM-as-judge `judge`
+    #  scoring. Everything below is additive; the mcqa / open_ended paths
+    #  above are untouched, so featherweight scores stay comparable.
+    # ══════════════════════════════════════════════════════════════════════
+
+    # ---- validation -------------------------------------------------------
+
+    def _validate_checks_item(self, obj, line_no):
+        p = obj.get("prompt")
+        if not isinstance(p, str) or not p.strip():
+            return f"line {line_no} 'checks' item needs a non-empty 'prompt'"
+        checks = obj.get("checks")
+        if not isinstance(checks, list) or not checks:
+            return f"line {line_no} 'checks' must be a non-empty list"
+        for j, c in enumerate(checks):
+            if not isinstance(c, dict) or "type" not in c:
+                return f"line {line_no} check {j} needs a 'type'"
+            if c["type"] not in _CHECK_TYPES:
+                return f"line {line_no} unknown check type {c['type']!r}"
+        mode = obj.get("scoring", "all")
+        if mode not in ("all", "fraction"):
+            return f"line {line_no} 'scoring' must be 'all' or 'fraction'"
+        if mode == "fraction":
+            pf = obj.get("pass_fraction", 1.0)
+            if not (isinstance(pf, (int, float)) and 0.0 < pf <= 1.0):
+                return f"line {line_no} 'pass_fraction' must be in (0, 1]"
+        return None
+
+    def _validate_judge_item(self, obj, line_no):
+        p = obj.get("prompt")
+        if not isinstance(p, str) or not p.strip():
+            return f"line {line_no} 'judge' item needs a non-empty 'prompt'"
+        r = obj.get("rubric")
+        if not isinstance(r, str) or not r.strip():
+            return f"line {line_no} 'judge' item needs a non-empty 'rubric'"
+        ms = obj.get("max_score", 5)
+        if not isinstance(ms, int) or isinstance(ms, bool) or ms < 2:
+            return f"line {line_no} 'max_score' must be an int >= 2"
+        pt = obj.get("pass_threshold")
+        if pt is not None and not (isinstance(pt, (int, float))
+                                   and not isinstance(pt, bool)
+                                   and 1 <= pt <= ms):
+            return f"line {line_no} 'pass_threshold' must be within 1..max_score"
+        if "reference" in obj and not isinstance(obj["reference"], str):
+            return f"line {line_no} optional 'reference' must be a string"
+        return None
+
+    # ---- deterministic checks ---------------------------------------------
+
+    def _score_checks(self, reply, q):
+        """Return (is_correct, passed, total, per_check_results)."""
+        reply = reply or ""
+        results = []
+        for c in q["checks"]:
+            ok, note = self._run_single_check(reply, c)
+            results.append({"type": c.get("type"), "passed": bool(ok), "note": note})
+        passed = sum(1 for r in results if r["passed"])
+        total = len(results)
+        if q.get("scoring", "all") == "fraction":
+            frac = (passed / total) if total else 0.0
+            is_correct = frac >= q.get("pass_fraction", 1.0)
+        else:
+            is_correct = (total > 0 and passed == total)
+        return is_correct, passed, total, results
+
+    def _run_single_check(self, reply, c):
+        t = c.get("type")
+        ic = c.get("ignore_case", True)
+        def hay(s):
+            return s.lower() if ic else s
+
+        if t in ("contains", "contains_any", "contains_all", "not_contains"):
+            vals = c.get("values")
+            if vals is None and "value" in c:
+                vals = [c["value"]]
+            vals = [str(v) for v in (vals or [])]
+            h = hay(reply)
+            present = [v for v in vals if hay(v) in h]
+            if t in ("contains", "contains_all"):
+                ok = len(vals) > 0 and len(present) == len(vals)
+            elif t == "contains_any":
+                ok = len(present) > 0
+            else:  # not_contains
+                ok = len(present) == 0
+            return ok, f"{len(present)}/{len(vals)} present"
+
+        if t == "regex":
+            # regex defaults to case-SENSITIVE: the pattern author controls
+            # case explicitly, and IGNORECASE silently breaks patterns like
+            # ^[^a-z]*$ (it would fold A-Z into the class too).
+            flags = re.IGNORECASE if c.get("ignore_case", False) else 0
+            if c.get("dotall"):
+                flags |= re.DOTALL
+            if c.get("multiline"):
+                flags |= re.MULTILINE
+            ok = re.search(c.get("pattern", ""), reply, flags) is not None
+            return ok, ("match" if ok else "no match")
+
+        if t == "equals":
+            if c.get("normalize", True):
+                a = self._normalize_open_text(reply)
+                b = self._normalize_open_text(str(c.get("value", "")))
+            else:
+                a, b = reply.strip(), str(c.get("value", "")).strip()
+            return a == b, f"got={a[:40]!r}"
+
+        if t in ("starts_with", "ends_with"):
+            s = hay(reply.strip())
+            v = hay(str(c.get("value", "")))
+            ok = s.startswith(v) if t == "starts_with" else s.endswith(v)
+            return ok, ""
+
+        if t in ("max_words", "min_words"):
+            n = len(re.findall(r"\S+", reply))
+            lim = c.get("value", c.get("equals"))
+            ok = (n <= lim) if t == "max_words" else (n >= lim)
+            return ok, f"{n} words (limit {lim})"
+
+        if t in ("max_chars", "min_chars"):
+            n = len(reply.strip())
+            lim = c.get("value")
+            ok = (n <= lim) if t == "max_chars" else (n >= lim)
+            return ok, f"{n} chars (limit {lim})"
+
+        if t == "line_count":
+            lines = [ln for ln in reply.splitlines() if ln.strip()]
+            n = len(lines)
+            if "equals" in c:
+                ok = n == c["equals"]
+            else:
+                ok = True
+                if "min" in c:
+                    ok = ok and n >= c["min"]
+                if "max" in c:
+                    ok = ok and n <= c["max"]
+            return ok, f"{n} non-empty lines"
+
+        if t in ("is_json", "json_has_key"):
+            data, err = self._try_parse_json(reply)
+            if err:
+                return False, "invalid json"
+            if t == "is_json":
+                return True, "valid json"
+            key = c.get("key")
+            ok = isinstance(data, dict) and key in data
+            return ok, f"key {key!r} {'found' if ok else 'missing'}"
+
+        return False, f"unimplemented check {t!r}"
+
+    def _try_parse_json(self, text):
+        s = (text or "").strip()
+        fence = re.search(r"```(?:json)?\s*(.*?)```", s, re.DOTALL | re.IGNORECASE)
+        if fence:
+            s = fence.group(1).strip()
+        try:
+            return json.loads(s), None
+        except Exception:
+            m = re.search(r"(\{.*\}|\[.*\])", s, re.DOTALL)
+            if m:
+                try:
+                    return json.loads(m.group(1)), None
+                except Exception as e:
+                    return None, str(e)
+            return None, "no json object found"
+
+    # ---- LLM-as-judge -----------------------------------------------------
+
+    def _judge_cfg_from_meta(self, meta):
+        cfg = {}
+        if isinstance(meta, dict) and isinstance(meta.get("judge"), dict):
+            cfg = dict(meta["judge"])
+        cfg.setdefault("backend", "openai")
+        return cfg
+
+    def _build_judge_prompt(self, user_prompt, reply, rubric, reference, max_score):
+        reply = (reply or "").strip()
+        parts = [
+            "You are a strict grader assessing an AI assistant's reply to a user, "
+            "for everyday chatbot quality. Judge ONLY against the rubric. Do not "
+            "reward length, verbosity, or confident tone on their own.",
+            "",
+            "[USER MESSAGE]",
+            user_prompt.strip(),
+            "",
+            "[ASSISTANT REPLY]",
+            reply if reply else "(the assistant produced no usable reply)",
+            "",
+            "[RUBRIC]",
+            rubric.strip(),
+        ]
+        if reference and reference.strip():
+            parts += ["", "[REFERENCE ANSWER — GUIDANCE ONLY, NOT THE ONLY VALID ANSWER]",
+                      reference.strip()]
+        parts += [
+            "",
+            f"Score the reply as an integer from 1 to {max_score} "
+            f"(1 = fails the rubric, {max_score} = fully satisfies it).",
+            "Respond in exactly two lines and nothing else:",
+            "SCORE: <integer>",
+            "REASON: <one short sentence>",
+        ]
+        return "\n".join(parts)
+
+    def _run_judge(self, user_prompt, reply, q, judge_cfg, ctx):
+        """Return (score_or_None, raw_judge_text_or_None, error_or_None)."""
+        max_score = q.get("max_score", 5)
+        judge_prompt = self._build_judge_prompt(
+            user_prompt, reply or "", q["rubric"], q.get("reference"), max_score
+        )
+        backend = judge_cfg.get("backend", "openai")
+        try:
+            if backend == "ctx_chat":
+                # Discouraged: uses the model under test as its own judge.
+                raw = ctx.chat(
+                    judge_prompt, history=[],
+                    sampling_override={"temperature": 0.0, "top_p": 1.0,
+                                       "top_k": 1, "max_new_tokens": 128},
+                )
+            elif backend == "openai":
+                raw = self._judge_call_openai(judge_prompt, judge_cfg)
+            else:
+                return None, None, f"unknown judge backend {backend!r}"
+        except Exception as e:
+            return None, None, f"judge call failed: {e}"
+        score = self._parse_judge_score(raw or "", max_score)
+        if score is None:
+            return None, (raw or ""), "could not parse judge score"
+        return score, (raw or ""), None
+
+    def _judge_call_openai(self, judge_prompt, cfg):
+        """Minimal OpenAI-compatible /v1/chat/completions call via stdlib.
+
+        Works with vLLM, llama.cpp server, LM Studio, Ollama's OpenAI shim,
+        or the real OpenAI/Anthropic-compatible gateways. Configure via the
+        test's _meta.judge block: {"backend":"openai","url":...,"model":...}.
+        """
+        import urllib.request
+        url = cfg.get("url") or cfg.get("endpoint")
+        if not url:
+            raise RuntimeError("judge.url is not set in the test's _meta.judge block")
+        body = {
+            "model": cfg.get("model", "judge"),
+            "messages": [{"role": "user", "content": judge_prompt}],
+            "temperature": cfg.get("temperature", 0.0),
+            "max_tokens": cfg.get("max_tokens", 128),
+        }
+        data = json.dumps(body).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        key_env = cfg.get("api_key_env")
+        if key_env and os.environ.get(key_env):
+            headers["Authorization"] = f"Bearer {os.environ[key_env]}"
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=cfg.get("timeout", 60)) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        return payload["choices"][0]["message"]["content"]
+
+    def _parse_judge_score(self, text, max_score):
+        if not text:
+            return None
+        m = re.search(r"score\s*[:=]?\s*(\d+(?:\.\d+)?)", text, re.IGNORECASE)
+        if not m:
+            m = re.search(r"\b(\d+(?:\.\d+)?)\s*/\s*\d+", text)
+        if not m:
+            m = re.search(r"\b(\d+(?:\.\d+)?)\b", text)
+        if not m:
+            return None
+        try:
+            val = float(m.group(1))
+        except ValueError:
+            return None
+        if val < 1:
+            val = 1.0
+        if val > max_score:
+            val = float(max_score)
+        # Return an int when it is one, for cleaner reports.
+        return int(val) if val == int(val) else val
 
     def _save_result(self, test_name, result, ctx):
         try:
