@@ -1138,10 +1138,9 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
 
 
     # ══════════════════════════════════════════════════════════════════════
-    #  Deterministic checks scoring + LLM-as-judge mode
-    #  Everything below is additive; the mcqa / open_ended paths
+    #  Deterministic `checks` scoring + LLM-as-judge `judge`
+    #  scoring. Everything below is additive; the mcqa / open_ended paths
     #  above are untouched, so featherweight scores stay comparable.
-    #  So all prior and future test results are still valid.
     # ══════════════════════════════════════════════════════════════════════
 
     # ---- validation -------------------------------------------------------
@@ -1351,7 +1350,7 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
         backend = judge_cfg.get("backend", "karotte")
         try:
             if backend == "ctx_chat":
-                # Discouraged: uses the model under test as its own judge. Basically never use this, only here for testing.
+                # Discouraged: uses the model under test as its own judge.
                 raw = ctx.chat(
                     judge_prompt, history=[],
                     sampling_override={"temperature": 0.0, "top_p": 1.0,
@@ -1401,19 +1400,27 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
         """Judge via KarotteAI session API (api.karotte128.de).
 
         From Karotte's docs:
-          POST /ai/create  {"model": ...}            -> {"uuid": ...}
-          POST /ai/chat    {"uuid": ..., "message":} -> {"response": ...}
-          DELETE /ai/delete {"uuid": ...}            -> {"status": "deleted"}
+          POST   /ai/create  {"model": ...}            -> {"uuid": ...}
+          POST   /ai/chat    {"uuid": ..., "message":} -> {"response": ...}
+          DELETE /ai/delete  {"uuid": ...}             -> {"status": "deleted"}
+          GET    /ai/list                              -> {"models": [...]}
 
-        We open a FRESH session for every grade and delete it in a finally,
-        so the judge never carries history between items (which would let one
-        item's grading contaminate the next) and sessions are never leaked.
-        Available models can be listed via GET /ai/list.
+        We open a FRESH session per grade and delete it in a finally, so the
+        judge never carries history between items and sessions are not leaked.
+
+        Robustness: server error bodies are surfaced, and a one-time /ai/list preflight checks endpoint.
+        Base URL and the individual routes are overridable via _meta.judge ("url" and "paths").
         """
         import urllib.request
+        import urllib.error
         base = (cfg.get("url") or "https://api.karotte128.de").rstrip("/")
         model = cfg.get("model", "kAI")
         timeout = cfg.get("timeout", 60)
+        paths = cfg.get("paths", {}) if isinstance(cfg.get("paths"), dict) else {}
+        p_create = paths.get("create", "/ai/create")
+        p_chat = paths.get("chat", "/ai/chat")
+        p_delete = paths.get("delete", "/ai/delete")
+        p_list = paths.get("list", "/ai/list")
 
         def _req(path, payload=None, method="POST"):
             data = json.dumps(payload).encode("utf-8") if payload is not None else None
@@ -1421,22 +1428,59 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
                 base + path, data=data,
                 headers={"Content-Type": "application/json"}, method=method,
             )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                body = ""
+                try:
+                    body = e.read().decode("utf-8", "replace").strip()[:200]
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"{method} {base + path} -> HTTP {e.code} {e.reason}"
+                    + (f" | body: {body}" if body else "")
+                ) from None
+            except urllib.error.URLError as e:
+                raise RuntimeError(
+                    f"{method} {base + path} -> unreachable ({e.reason}); "
+                    f"check the judge 'url' in _meta.judge"
+                ) from None
 
-        created = _req("/ai/create", {"model": model})
+        # ── preflight per base URL to pinpoint any config problems ──
+        cache = getattr(self, "_karotte_cache", None)
+        if cache is None:
+            cache = self._karotte_cache = {}
+        if base not in cache:
+            note = None
+            try:
+                listing = _req(p_list, None, "GET")
+                models = listing.get("models") if isinstance(listing, dict) else None
+                if isinstance(models, list) and model not in models:
+                    note = (f"judge model {model!r} is not offered at {base} "
+                            f"(available: {', '.join(map(str, models))}) "
+                            f"— fix 'model' in _meta.judge")
+            except Exception as e:
+                note = (f"preflight to {base + p_list} failed ({e}); the judge "
+                        f"'url'/'paths' in _meta.judge likely don't match the "
+                        f"deployed API — confirm the routes with Karotte")
+            cache[base] = note
+        if cache[base]:
+            raise RuntimeError(cache[base])
+
+        created = _req(p_create, {"model": model})
         uuid = created.get("uuid")
         if uuid is None:
-            raise RuntimeError(f"karotte /ai/create returned no uuid: {created!r}")
+            raise RuntimeError(f"/ai/create returned no uuid: {created!r}")
         try:
-            out = _req("/ai/chat", {"uuid": uuid, "message": judge_prompt})
+            out = _req(p_chat, {"uuid": uuid, "message": judge_prompt})
             resp = out.get("response")
             if resp is None:
-                raise RuntimeError(f"karotte /ai/chat returned no response: {out!r}")
+                raise RuntimeError(f"/ai/chat returned no 'response': {out!r}")
             return resp
         finally:
             try:
-                _req("/ai/delete", {"uuid": uuid}, method="DELETE")
+                _req(p_delete, {"uuid": uuid}, method="DELETE")
             except Exception:
                 pass  # best-effort cleanup; never mask the real result/error
 
