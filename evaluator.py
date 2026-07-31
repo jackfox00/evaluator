@@ -1138,7 +1138,7 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
 
 
     # ══════════════════════════════════════════════════════════════════════
-    #  Deterministic `checks` scoring + LLM-as-judge `judge`
+    #  ChatbotGym: deterministic `checks` scoring + LLM-as-judge `judge`
     #  scoring. Everything below is additive; the mcqa / open_ended paths
     #  above are untouched, so featherweight scores stay comparable.
     # ══════════════════════════════════════════════════════════════════════
@@ -1373,7 +1373,7 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
         """OpenAI-compatible /v1/chat/completions call via stdlib.
 
         Works with vLLM, llama.cpp server, LM Studio, Ollama's OpenAI shim,
-        or OpenAI/Anthropic-compatible gateways. Configure via the
+        or any other OpenAI/Anthropic-compatible gateways. Configure via the
         test's _meta.judge block: {"backend":"openai","url":...,"model":...}.
         """
         import urllib.request
@@ -1397,29 +1397,26 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
         return payload["choices"][0]["message"]["content"]
 
     def _judge_call_karotte(self, judge_prompt, cfg):
-        """Judge via KarotteAI session API (api.karotte128.de).
+        """Judge via KarotteAI API (api.karotte128.de), per his reference client.
 
-        From Karotte's docs:
-          POST   /ai/create  {"model": ...}            -> {"uuid": ...}
-          POST   /ai/chat    {"uuid": ..., "message":} -> {"response": ...}
-          DELETE /ai/delete  {"uuid": ...}             -> {"status": "deleted"}
-          GET    /ai/list                              -> {"models": [...]}
+        Actual methods:
+          GET  /ai/list                                       -> {"models": [...]}
+          POST /ai/chat {"model","message_history","message"}  -> {"answer","message_history"}
 
-        We open a FRESH session per grade and delete it in a finally, so the
-        judge never carries history between items and sessions are not leaked.
-
-        Robustness: server error bodies are surfaced, and a one-time /ai/list preflight checks endpoint.
-        Base URL and the individual routes are overridable via _meta.judge ("url" and "paths").
+        For grading we want each item independent, so we send a fresh empty
+        history ({}) every time and read `answer` (discarding the returned
+        history). A one-time /ai/list preflight validates the base URL and model;
+        server error bodies are surfaced. Routes are overridable via _meta.judge
+        "paths". Note: /ai/chat exposes no sampling controls, so the judge cannot
+        be pinned to temperature 0 — run the set 2-3x and average.
         """
         import urllib.request
         import urllib.error
         base = (cfg.get("url") or "https://api.karotte128.de").rstrip("/")
-        model = cfg.get("model", "kAI")
+        model = cfg.get("model", "silas")
         timeout = cfg.get("timeout", 60)
         paths = cfg.get("paths", {}) if isinstance(cfg.get("paths"), dict) else {}
-        p_create = paths.get("create", "/ai/create")
         p_chat = paths.get("chat", "/ai/chat")
-        p_delete = paths.get("delete", "/ai/delete")
         p_list = paths.get("list", "/ai/list")
 
         def _req(path, payload=None, method="POST"):
@@ -1447,7 +1444,7 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
                     f"check the judge 'url' in _meta.judge"
                 ) from None
 
-        # ── preflight per base URL to pinpoint any config problems ──
+        # ── one-time preflight per base URL: pinpoint config problems ──
         cache = getattr(self, "_karotte_cache", None)
         if cache is None:
             cache = self._karotte_cache = {}
@@ -1468,21 +1465,12 @@ class EvaluatorPlugin(Plugin):  # noqa: F821 — Plugin is injected by the loade
         if cache[base]:
             raise RuntimeError(cache[base])
 
-        created = _req(p_create, {"model": model})
-        uuid = created.get("uuid")
-        if uuid is None:
-            raise RuntimeError(f"/ai/create returned no uuid: {created!r}")
-        try:
-            out = _req(p_chat, {"uuid": uuid, "message": judge_prompt})
-            resp = out.get("response")
-            if resp is None:
-                raise RuntimeError(f"/ai/chat returned no 'response': {out!r}")
-            return resp
-        finally:
-            try:
-                _req(p_delete, {"uuid": uuid}, method="DELETE")
-            except Exception:
-                pass  # best-effort cleanup; never mask the real result/error
+        # single stateless turn: fresh empty history so grades stay independent
+        out = _req(p_chat, {"model": model, "message_history": {}, "message": judge_prompt})
+        answer = out.get("answer")
+        if answer is None:
+            raise RuntimeError(f"/ai/chat returned no 'answer': {out!r}")
+        return answer
 
     def _parse_judge_score(self, text, max_score):
         if not text:
